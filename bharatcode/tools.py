@@ -231,6 +231,7 @@ TOOLS = [
     },
     {
         "type": "function",
+        "execution_mode": "parallel",
         "function": {
             "name": "glob",
             "description": (
@@ -258,6 +259,7 @@ TOOLS = [
     },
     {
         "type": "function",
+        "execution_mode": "parallel",
         "function": {
             "name": "grep",
             "description": (
@@ -295,6 +297,7 @@ TOOLS = [
     },
     {
         "type": "function",
+        "execution_mode": "parallel",
         "function": {
             "name": "web_fetch",
             "description": (
@@ -321,6 +324,7 @@ TOOLS = [
     },
     {
         "type": "function",
+        "execution_mode": "parallel",
         "function": {
             "name": "list_dir",
             "description": (
@@ -419,6 +423,7 @@ TOOLS = [
     },
     {
         "type": "function",
+        "execution_mode": "parallel",
         "function": {
             "name": "spawn_agent",
             "description": (
@@ -628,7 +633,7 @@ def _kill_proc_tree(proc) -> None:
 
 
 def _cleanup_bg_procs() -> None:
-    """Never leave servers running after BharatCode exits."""
+    """Never leave servers running after Sylithe Code exits."""
     for info in list(_BG_PROCS.values()):
         proc = info.get("proc")
         if proc is not None and proc.poll() is None:
@@ -935,7 +940,7 @@ def web_fetch(url: str, max_chars: int = 8000) -> str:
         import html
         req = urllib.request.Request(
             url,
-            headers={"User-Agent": "BharatCode/1.0 (AI coding agent)"}
+            headers={"User-Agent": "Sylithe Code/1.0 (AI coding agent)"}
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
             raw = resp.read().decode("utf-8", errors="replace")

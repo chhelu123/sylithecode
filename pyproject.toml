@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bharatcode"
-version = "0.1.0"
+version = "0.1.1"
 description = "AI Coding Agent for Indian Developers — powered by DeepSeek"
 readme = "README.md"
 license = { text = "MIT" }
@@ -31,6 +31,7 @@ dependencies = [
 ]
 
 [project.scripts]
+sylithecode = "bharatcode.main:cli"
 bharatcode = "bharatcode.main:cli"
 
 [project.urls]

@@ -3,7 +3,7 @@ Slash commands — like Claude Code's /clear, /compact, /review, /cost, /doctor,
 """
 import os
 from .ui import console, show_info, show_success, show_warning, show_error
-from .config import load_config, save_config
+from .config import load_config, save_config, model_label
 
 
 # ── Interactive dropdown helpers ───────────────────────────────────────────────
@@ -464,7 +464,7 @@ def cmd_cost(args: str, session: dict):
     from .cost import session_cost
     session_cost.display(console)
 
-@command("status", "Show BharatCode version, model, API status")
+@command("status", "Show Sylithe Code version, model, API status")
 def cmd_status(args: str, session: dict):
     import platform
     from . import __version__
@@ -482,9 +482,9 @@ def cmd_status(args: str, session: dict):
     except Exception:
         pass
 
-    console.print(f"\n[bold]BharatCode Status[/bold]")
+    console.print(f"\n[bold]Sylithe Code Status[/bold]")
     console.print(f"  [dim]Version[/dim]    [cyan]{__version__}[/cyan]")
-    console.print(f"  [dim]Model[/dim]      [cyan]{cfg.get('model', 'deepseek-v4-flash')}[/cyan]")
+    console.print(f"  [dim]Model[/dim]      [cyan]{model_label(cfg.get('model', 'deepseek-v4-flash'))}[/cyan]")
     console.print(f"  [dim]API key[/dim]    {key_display}")
     console.print(f"  [dim]API status[/dim] {'[green]connected[/green]' if api_ok else '[red]unreachable[/red]'}")
     console.print(f"  [dim]Python[/dim]     [cyan]{platform.python_version()}[/cyan]")
@@ -492,7 +492,7 @@ def cmd_status(args: str, session: dict):
     console.print(f"  [dim]Workdir[/dim]    [cyan]{os.getcwd()}[/cyan]")
     console.print()
 
-@command("doctor", "Diagnose BharatCode setup")
+@command("doctor", "Diagnose Sylithe Code setup")
 def cmd_doctor(args: str, session: dict):
     import subprocess
     checks = []
@@ -539,7 +539,7 @@ def cmd_doctor(args: str, session: dict):
     has_md = (os.path.exists("BHARATCODE.md"))
     checks.append(("BHARATCODE.md in project", has_md, "found" if has_md else "run: bharatcode init"))
 
-    console.print("\n[bold]BharatCode Doctor[/bold]\n")
+    console.print("\n[bold]Sylithe Code Doctor[/bold]\n")
     for name, ok, detail in checks:
         icon  = "[green]✓[/green]" if ok else "[red]✗[/red]"
         color = "dim" if ok else "red"
@@ -547,7 +547,7 @@ def cmd_doctor(args: str, session: dict):
     console.print()
     all_ok = all(ok for _, ok, _ in checks)
     if all_ok:
-        show_success("All checks passed! BharatCode is ready.")
+        show_success("All checks passed! Sylithe Code is ready.")
     else:
         show_warning("Some checks failed. Fix the issues above.")
 
@@ -650,18 +650,21 @@ def cmd_yolo(args: str, session: dict):
     else:
         console.print("[green]Auto-approve OFF[/green] — permission prompts restored.")
 
-@command("model", "Switch model: /model deepseek-v4-flash | deepseek-v4-pro")
+@command("model", "Switch model: /model sylithe-flash | sylithe-pro")
 def cmd_model(args: str, session: dict):
     if not args:
         cfg = load_config()
-        show_info(f"Current model: {cfg.get('model')}")
-        console.print("  Options: [cyan]deepseek-v4-flash[/cyan]  [cyan]deepseek-v4-pro[/cyan]")
-        console.print("  [dim]Aliases:  deepseek-chat → v4-flash  |  deepseek-reasoner → v4-pro[/dim]")
+        show_info(f"Current model: {model_label(cfg.get('model', 'deepseek-v4-flash'))}")
+        console.print("  Options: [cyan]Sylithe Code Flash[/cyan]  [cyan]Sylithe Code Pro[/cyan]")
+        console.print("  [dim]Usage: /model sylithe-flash  or  /model sylithe-pro[/dim]")
         return
+    from .config import MODEL_API_MAP
+    name = args.strip()
+    api_name = MODEL_API_MAP.get(name, name)
     cfg = load_config()
-    cfg["model"] = args.strip()
+    cfg["model"] = api_name
     save_config(cfg)
-    show_success(f"Model switched to: {args.strip()}")
+    show_success(f"Model switched to: {model_label(api_name)}")
 
 @command("pwd", "Show current working directory")
 def cmd_pwd(args: str, session: dict):
@@ -697,7 +700,7 @@ def cmd_agent(args: str, session: dict):
             for atype, info in AGENT_TYPES.items()
         ]
         console.print(
-            "\n[bold]BharatCode Agents[/bold]  [dim]— each specialist runs with its own isolated context[/dim]"
+            "\n[bold]Sylithe Code Agents[/bold]  [dim]— each specialist runs with its own isolated context[/dim]"
         )
         agent_type = _select("Which agent do you want to spawn?", choices)
         if not agent_type:
@@ -757,7 +760,7 @@ def cmd_coordinator(args: str, session: dict):
     from rich.panel import Panel
     console.print(Panel(
         "[bold cyan]Coordinator Mode[/bold cyan]\n\n"
-        "BharatCode is now your orchestrator. It will:\n\n"
+        "Sylithe Code is now your orchestrator. It will:\n\n"
         "  🚀  [cyan]spawn_worker[/cyan]   — launch parallel specialist agents (non-blocking)\n"
         "  📨  [cyan]send_message[/cyan]   — continue a worker with new instructions\n"
         "  🛑  [cyan]task_stop[/cyan]      — kill a worker that went off track\n\n"
@@ -816,11 +819,65 @@ def cmd_exit_coordinator(args: str, session: dict):
 
 # ── Help ──────────────────────────────────────────────────────────────────────
 
+@command("export", "Export session as Markdown: /export  or  /export session.md")
+def cmd_export(args: str, session: dict):
+    """Save the current conversation to a Markdown file."""
+    import datetime
+    from pathlib import Path
+
+    history = session.get("messages", [])
+    if not history:
+        show_warning("Nothing to export — conversation is empty.")
+        return
+
+    # Build output path
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    default_name = f"bharatcode_session_{ts}.md"
+    out_path = Path(args.strip() or default_name)
+    if out_path.is_dir():
+        out_path = out_path / default_name
+
+    lines: list[str] = [f"# BharatCode Session — {datetime.datetime.now():%Y-%m-%d %H:%M}\n\n"]
+    for msg in history:
+        role = msg.get("role", "")
+        if role == "user":
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                # multipart: extract text blocks only
+                content = " ".join(
+                    b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+                )
+            lines.append(f"**You:** {content}\n\n")
+        elif role == "assistant":
+            content = msg.get("content") or ""
+            if isinstance(content, list):
+                content = " ".join(
+                    b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+                )
+            if content:
+                lines.append(f"**BharatCode:** {content}\n\n")
+            # tool calls summary
+            tool_calls = msg.get("tool_calls", [])
+            if tool_calls:
+                names = ", ".join(
+                    tc.get("function", {}).get("name", "?") for tc in tool_calls
+                )
+                lines.append(f"*Tools used: {names}*\n\n")
+        elif role == "tool":
+            pass  # skip raw tool results — they clutter the export
+
+    try:
+        out_path.write_text("".join(lines), encoding="utf-8")
+        show_success(f"Session exported to {out_path}  ({len(history)} messages)")
+    except Exception as exc:
+        show_error(f"Export failed: {exc}")
+
+
 _HELP_GROUPS = {
     "Scaffold":      ["newsite", "newapp"],
     "Coordinator":   ["coordinator", "workers", "exit-coordinator"],
     "Sub-agents":    ["agent"],
-    "Conversation":  ["clear", "compact", "changes", "resume"],
+    "Conversation":  ["clear", "compact", "changes", "resume", "export"],
     "Code Actions":  ["review", "audit", "plan"],
     "Skills":        ["skills", "skill"],
     "Git":           ["git", "diff"],
@@ -919,7 +976,7 @@ def cmd_help(args: str, session: dict):
         "compact": (
             "Compresses old conversation history into a dense summary to free up context tokens.\n"
             "Use when: the agent seems to lose track, or the session has been running for a long time.\n"
-            "BharatCode also auto-compacts when history exceeds ~50,000 tokens."
+            "Sylithe Code also auto-compacts when history exceeds ~50,000 tokens."
         ),
         "yolo": (
             "Toggles auto-approve mode — skips all permission prompts for bash, write, and edit.\n"
@@ -927,14 +984,13 @@ def cmd_help(args: str, session: dict):
             "Green = ON (no prompts).  Default = OFF (prompts on bash commands)."
         ),
         "model": (
-            "Switch the DeepSeek model. BharatCode also auto-selects based on task complexity.\n"
-            "/model deepseek-v4-flash  — fast, cheap, great for most tasks (~$0.27/1M in)\n"
-            "/model deepseek-v4-pro    — deeper reasoning, use for debugging / architecture (~$0.55/1M in)\n"
-            "Old names still work: deepseek-chat → v4-flash  |  deepseek-reasoner → v4-pro\n"
-            "Auto-select upgrades flash → pro for complex tasks automatically."
+            "Switch the model. Sylithe Code also auto-selects based on task complexity.\n"
+            "/model sylithe-flash  — Sylithe Code Flash, fast, cheap, great for most tasks (~$0.27/1M in)\n"
+            "/model sylithe-pro    — Sylithe Code Pro, deeper reasoning, debugging / architecture (~$0.55/1M in)\n"
+            "Auto-select upgrades Flash → Pro for complex tasks automatically."
         ),
         "coordinator": (
-            "Enters coordinator mode — BharatCode becomes an orchestrator that spawns\n"
+            "Enters coordinator mode — Sylithe Code becomes an orchestrator that spawns\n"
             "parallel specialist workers instead of doing the work itself.\n\n"
             "Workflow:\n"
             "  1. You send a task (e.g. 'fix the auth bug and add tests')\n"

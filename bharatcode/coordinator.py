@@ -1,5 +1,5 @@
 """
-BharatCode Coordinator Mode — multi-worker orchestration engine.
+Sylithe Code Coordinator Mode — multi-worker orchestration engine.
 
 The coordinator is the main agent in a special mode. It spawns async workers,
 receives <task-notification> XML when they finish, synthesizes results, and
@@ -409,7 +409,7 @@ COORDINATOR_SYSTEM_PROMPT = """
 ## COORDINATOR MODE — ACTIVE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-You are BharatCode operating as a **coordinator**. You do NOT write code yourself.
+You are Sylithe Code operating as a **coordinator**. You do NOT write code yourself.
 You orchestrate specialist workers, synthesize their results, and direct the work.
 
 ═══════════════════════════════════════════════════════════
@@ -636,7 +636,7 @@ _WORKER_INSTRUCTIONS = """
 ## WORKER MODE — YOU ARE A BACKGROUND SPECIALIST
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-You are a background worker spawned by the BharatCode coordinator.
+You are a background worker spawned by the Sylithe Code coordinator.
 The coordinator sent you a precise task. Execute it completely.
 
 RULES (non-negotiable):

@@ -1,5 +1,5 @@
 """
-BharatCode Subagent System — parallel specialist agents that work while you work.
+Sylithe Code Subagent System — parallel specialist agents that work while you work.
 
 Each agent type has a dedicated role, restricted toolset, and purpose-built system prompt.
 The main agent spawns them via the `spawn_agent` tool; they run, report back, and disappear.

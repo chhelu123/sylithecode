@@ -59,7 +59,8 @@ class SessionCost:
         t.add_column("key",   style="dim",   no_wrap=True)
         t.add_column("value", style="cyan",  no_wrap=True)
 
-        t.add_row("Model",          self.model)
+        from .config import model_label
+        t.add_row("Model",          model_label(self.model))
         t.add_row("Turns",          str(self.turns))
         t.add_row("Tool calls",     str(self.tool_calls))
         t.add_row("Input tokens",   f"{self.prompt_tokens:,}")

@@ -27,8 +27,8 @@ TOOL_ICONS = {
 
 def show_banner():
     console.print(Panel(
-        "[bold green]BharatCode[/bold green]  [dim]AI Coding Agent for Indian Developers[/dim]\n"
-        "[dim]Powered by DeepSeek  |  Type /help for commands  |  Ctrl+C to exit[/dim]",
+        "[bold green]Sylithe Code[/bold green]  [dim]AI Coding Agent for Indian Developers[/dim]\n"
+        "[dim]Powered by Sylithe  |  Type /help for commands  |  Ctrl+C to exit[/dim]",
         border_style="green",
         padding=(0, 2),
     ))
@@ -43,7 +43,7 @@ def show_response(text: str):
     console.print(Panel(
         Markdown(text),
         border_style="green",
-        title="[bold green]BharatCode[/bold green]",
+        title="[bold green]Sylithe Code[/bold green]",
         padding=(0, 1),
     ))
 

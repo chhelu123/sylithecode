@@ -1,4 +1,4 @@
-"""BharatCode — AI Coding Agent for Indian Developers"""
+"""Sylithe Code — AI Coding Agent for Indian Developers"""
 __version__ = "0.1.0"
 
 # Force UTF-8 output streams so emoji/Unicode never crash on cp1252 consoles

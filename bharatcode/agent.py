@@ -35,7 +35,7 @@ FILE_MARKER_RE = re.compile(
     re.DOTALL
 )
 
-SYSTEM_PROMPT = r"""You are BharatCode — an autonomous AI coding agent built for Indian developers. You think step-by-step, execute tasks completely, write production-quality code, and always finish what you start.
+SYSTEM_PROMPT = r"""You are Sylithe Code — an autonomous AI coding agent built for Indian developers. You think step-by-step, execute tasks completely, write production-quality code, and always finish what you start.
 
 ## RULE 1 — NEVER USE TOOLS UNSOLICITED
 Only call a tool when the task genuinely requires it. Do NOT explore the filesystem, read files, or run commands just to "get context" unless asked.
@@ -759,7 +759,7 @@ def _git_checkpoint(project_path: str, message: str, init: bool = False):
         _sp.run(["git", "add", "-A"], cwd=str(root), capture_output=True, timeout=30)
         msg = f"bharatcode: {message[:60].strip()}" if message and message.strip() else "bharatcode checkpoint"
         r = _sp.run(
-            ["git", "-c", "user.name=BharatCode", "-c", "user.email=bharatcode@local",
+            ["git", "-c", "user.name=Sylithe Code", "-c", "user.email=bharatcode@local",
              "commit", "-q", "-m", msg],
             cwd=str(root), capture_output=True, encoding="utf-8", errors="replace", timeout=30,
         )
@@ -831,7 +831,117 @@ _HISTORY_FULL_RECENT  = 40      # recent messages always sent full to API
 # control, not survival. Keep generous headroom: aggressive compression is what
 # makes the model edit blind and fail tasks. /compact still works manually.
 _COMPACT_THRESHOLD    = 150000  # ~150K estimated tokens before auto-compacting
-_COMPACT_TARGET_RATIO = 0.40    # compact oldest 40% so plenty of context survives
+_COMPACT_TARGET_RATIO = 0.40    # fallback: compact oldest 40% if no safe cut found
+_COMPACT_KEEP_RECENT  = 20_000  # target tokens to keep after compaction
+
+# Built from tool definitions — any tool declaring execution_mode="parallel" runs concurrently.
+# Tools with no shared mutable session state (no cache writes, no RULE 10 checks) qualify.
+_PARALLEL_TOOLS = {
+    t["function"]["name"]
+    for t in TOOLS
+    if t.get("execution_mode") == "parallel"
+}
+
+# Returned by a tool to signal the agent loop should stop after this batch.
+# When EVERY tool in a batch returns this sentinel the outer loop exits immediately
+# without waiting for the model to produce another response.
+_TERMINATE_SENTINEL = "__BHARATCODE_TERMINATE__"
+
+# ── API error classification ──────────────────────────────────────────────────
+# Three error buckets, each routed differently:
+#   billing  → stop immediately (retrying hits the same wall)
+#   overflow → compact history and retry the current turn
+#   transient → exponential backoff, up to 5 attempts
+#   unknown  → one retry then surface to user
+
+_BILLING_ERR_RE = re.compile(
+    r"billing|insufficient.?quota|out.?of.?budget|usage.?limit|available.?balance"
+    r"|free.?usage.?limit|monthly.?limit|GoUsageLimitError|FreeUsageLimitError"
+    r"|payment.?required|your.?account",
+    re.IGNORECASE,
+)
+_OVERFLOW_ERR_RE = re.compile(
+    r"context.?(length|window|limit|size)|maximum.?context|token.?limit"
+    r"|prompt.?too.?long|input.?too.?long|reduce.?the.?length|too.?many.?token"
+    r"|context_length_exceeded|maximum_context_length",
+    re.IGNORECASE,
+)
+_TRANSIENT_ERR_RE = re.compile(
+    r"overload|rate.?limit|429|5\d\d|service.?unavailable|bad.?gateway"
+    r"|gateway.?timeout|network.?error|connection|timed?.?out|stream.?ended"
+    r"|websocket|fetch.?failed|terminated|retry|internal.?server",
+    re.IGNORECASE,
+)
+
+def _classify_api_error(exc: Exception) -> str:
+    """Return 'billing', 'overflow', 'transient', or 'unknown'."""
+    msg = str(exc)
+    if _BILLING_ERR_RE.search(msg):
+        return "billing"
+    if _OVERFLOW_ERR_RE.search(msg):
+        return "overflow"
+    if _TRANSIENT_ERR_RE.search(msg):
+        return "transient"
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    if isinstance(status, int):
+        if status == 429 or status >= 500:
+            return "transient"
+        if status == 400 and "context" in msg.lower():
+            return "overflow"
+    return "unknown"
+
+# ── Compaction summarization prompts ─────────────────────────────────────────
+
+SUMMARIZATION_SYSTEM_PROMPT = (
+    "You are a context summarization assistant. "
+    "Read the conversation and produce a structured summary following the exact format. "
+    "Do NOT continue the conversation or answer questions in it. ONLY output the summary."
+)
+
+_SUMMARIZE_PROMPT = """\
+Create a structured context checkpoint that will let the AI continue this work.
+
+## Goal
+[What is the user trying to accomplish? List multiple items if needed.]
+
+## Constraints & Preferences
+- [Any constraints, preferences, or requirements mentioned — or "(none)"]
+
+## Progress
+### Done
+- [x] [Completed tasks/changes with exact file names]
+
+### In Progress
+- [ ] [What was being worked on when history was cut]
+
+### Blocked
+- [Issues preventing progress — or "(none)"]
+
+## Key Decisions
+- **[Decision]**: [Brief rationale]
+
+## Next Steps
+1. [Ordered list of what to do next]
+
+## Critical Context
+- [Data, examples, error messages, exact file paths needed to continue — or "(none)"]
+
+Keep each section concise. Preserve exact file paths, function names, and error messages."""
+
+_UPDATE_SUMMARIZE_PROMPT = """\
+Update the existing summary (in <previous-summary> tags) with the NEW messages above.
+
+RULES:
+- PRESERVE all existing information from the previous summary
+- ADD new progress, decisions, context from the new messages
+- Move items from "In Progress" → "Done" when completed
+- Update "Next Steps" based on what was accomplished
+- Remove resolved blockers; preserve exact file paths and error messages
+
+Use the same format: Goal / Constraints & Preferences / Progress (Done/In Progress/Blocked) \
+/ Key Decisions / Next Steps / Critical Context
+
+Keep each section concise."""
 
 
 _REASONING_PATTERNS = [
@@ -991,34 +1101,100 @@ def _build_api_messages(system_content: str, history: list) -> list:
     return [system_msg] + [_compress(m) for m in old] + recent
 
 
-def _auto_compact(history: list, client, model: str, file_cache: dict = None) -> bool:
+def _find_cut_point(history: list, keep_tokens: int) -> int:
+    """Return the index into history where we cut:
+       history[:cut] is summarized, history[cut:] is kept.
+    Walks backward accumulating tokens until keep_tokens is reached,
+    then snaps to the nearest 'user' message boundary so we never cut
+    inside an assistant(tool_calls) + tool-result block.
+    Falls back to the old 40% ratio when no safe cut is found."""
+    import json as _j
+
+    accumulated   = 0
+    last_safe_cut = None   # most recent user-msg index seen while walking backward
+
+    for i in range(len(history) - 1, -1, -1):
+        msg = history[i]
+        if msg.get("role") == "user":
+            last_safe_cut = i
+        accumulated += len(_j.dumps(msg, ensure_ascii=False)) // 4
+        if accumulated >= keep_tokens and last_safe_cut is not None and last_safe_cut > 0:
+            return last_safe_cut
+
+    # Fallback: cut at 40% if no safe boundary found inside the budget
+    return max(4, int(len(history) * _COMPACT_TARGET_RATIO))
+
+
+def _auto_compact(
+    history: list,
+    client,
+    model: str,
+    file_cache: dict = None,
+    last_context_tokens: int = 0,
+    force: bool = False,
+) -> bool:
     """
-    When history grows too large, summarise the oldest 40% into a compact message.
-    Feature 6: file_cache keys are included in the compaction prompt so file
-    knowledge (paths, purposes, key symbols) survives the compaction.
+    Summarise old history into a structured checkpoint when context is too large.
     Mutates history in-place. Returns True if compaction happened.
+
+    Improvements over the old version:
+    - Uses actual API prompt-token count (last_context_tokens) when available,
+      falls back to char/4 estimation
+    - Smart cut point: keeps last ~20K tokens, cuts only at user-msg boundaries
+      so we never split an assistant(tool_calls) + tool-result block
+    - Structured summary (Goal / Progress / Key Decisions / Next Steps / Context)
+    - Incremental updates: detects a prior compaction summary in history and calls
+      the UPDATE prompt instead of discarding the old summary
+    - Tracks read vs modified files and appends them to the summary
     """
-    if _estimate_tokens(history) < _COMPACT_THRESHOLD:
+    context_tokens = last_context_tokens if last_context_tokens > 0 else _estimate_tokens(history)
+    if not force and context_tokens < _COMPACT_THRESHOLD:
         return False
 
-    cutoff = max(4, int(len(history) * _COMPACT_TARGET_RATIO))
-    # Never cut inside an assistant(tool_calls) + tool-result block.
-    while cutoff < len(history) and history[cutoff].get("role") == "tool":
-        cutoff += 1
+    cutoff = _find_cut_point(history, _COMPACT_KEEP_RECENT)
+    if cutoff <= 0:
+        return False
+
     to_summarise = history[:cutoff]
     keep         = history[cutoff:]
 
-    # Preserve the ORIGINAL task verbatim — losing the goal mid-task is the
-    # worst possible compaction failure. Skip injected system-ish messages.
-    first_user = next(
-        (m for m in to_summarise
-         if m.get("role") == "user"
-         and not str(m.get("content", "")).startswith(("[FILE CACHE RESTORED", "[SYSTEM]", "<task-notification"))),
-        None,
-    )
+    # ── Detect previous compaction for incremental update ───────────────────
+    previous_summary = None
+    summary_start    = 0
+    for i, m in enumerate(to_summarise):
+        if (m.get("role") == "assistant"
+                and str(m.get("content", "")).startswith("[AUTO-COMPACTED")):
+            previous_summary = m.get("content", "")
+            summary_start    = i + 1   # only summarize messages AFTER old compaction
+            break
 
+    messages_to_summarise = to_summarise[summary_start:]
+    if not messages_to_summarise:
+        return False
+
+    # ── Track file operations ────────────────────────────────────────────────
+    import json as _j
+    read_files:     set[str] = set()
+    modified_files: set[str] = set()
+    for m in messages_to_summarise:
+        for tc in (m.get("tool_calls") or []):
+            fn    = tc.get("function", {})
+            fname = fn.get("name", "")
+            try:
+                path = _j.loads(fn.get("arguments", "{}")).get("path", "")
+            except Exception:
+                path = ""
+            if not path:
+                continue
+            if fname in ("write_file", "edit_file"):
+                modified_files.add(path)
+                read_files.discard(path)
+            elif fname == "read_file" and path not in modified_files:
+                read_files.add(path)
+
+    # ── Build conversation dump ──────────────────────────────────────────────
     lines = []
-    for m in to_summarise:
+    for m in messages_to_summarise:
         role    = m["role"].upper()
         content = m.get("content") or ""
         if m.get("tool_calls"):
@@ -1027,70 +1203,86 @@ def _auto_compact(history: list, client, model: str, file_cache: dict = None) ->
                 lines.append(f"[TOOL_CALL] {fn.get('name')}({fn.get('arguments','')[:120]})")
         elif content:
             lines.append(f"[{role}]: {content[:1200]}")
-
     dump = "\n".join(lines)
 
-    # Feature 6: inject file cache keys so the summary mentions all touched files
-    file_hint = ""
+    # Preserve the original user task verbatim across compactions
+    first_user = next(
+        (m for m in to_summarise
+         if m.get("role") == "user"
+         and not str(m.get("content", "")).startswith(
+             ("[FILE CACHE RESTORED", "[SYSTEM]", "<task-notification", "[ORIGINAL TASK"))),
+        None,
+    )
+
+    # ── Build summarization prompt ───────────────────────────────────────────
+    prompt = f"<conversation>\n{dump}\n</conversation>\n\n"
+    if previous_summary:
+        prompt += f"<previous-summary>\n{previous_summary}\n</previous-summary>\n\n"
+        prompt += _UPDATE_SUMMARIZE_PROMPT
+    else:
+        prompt += _SUMMARIZE_PROMPT
+
+    # Inject file cache paths as context hints
     known = _cache_paths(file_cache)[:25] if file_cache else []
     if known:
-        file_hint = (
-            "\n\nFILES IN SESSION CACHE — include each in the summary with its purpose:\n"
-            + "\n".join(f"  - {p}  ({file_cache[p].count(chr(10)) + 1} lines)"
-                        for p in known)
+        prompt += (
+            "\n\nFILES IN SESSION CACHE — include each in Critical Context with its purpose:\n"
+            + "\n".join(f"  - {p}  ({file_cache[p].count(chr(10)) + 1} lines)" for p in known)
         )
 
     try:
         resp = client.chat.completions.create(
             model=model,
-            messages=[{
-                "role": "user",
-                "content": (
-                    "Summarise this AI coding session for persistent memory. "
-                    "PRESERVE: every file path + line count + what it contains, "
-                    "all code decisions, all bugs found/fixed, all data/numbers, "
-                    "user preferences. Be dense and specific — no filler.\n\n"
-                    f"CONVERSATION:\n{dump}"
-                    f"{file_hint}"
-                )
-            }],
+            messages=[
+                {"role": "system", "content": SUMMARIZATION_SYSTEM_PROMPT},
+                {"role": "user",   "content": prompt},
+            ],
             max_tokens=2000,
             temperature=0.1,
         )
         summary = resp.choices[0].message.content.strip()
-        compact_msg = {
-            "role": "assistant",
-            "content": f"[AUTO-COMPACTED SESSION SUMMARY — {cutoff} messages → 1]\n{summary}"
-        }
-        prefix = []
-        if first_user is not None:
-            prefix.append({
-                "role": "user",
-                "content": f"[ORIGINAL TASK — preserved through compaction]\n{first_user.get('content', '')}"
-            })
-        history[:] = prefix + [compact_msg] + keep
-
-        # Re-inject files that were actively used in the compacted range
-        # so the model keeps full working context without re-reading from disk.
-        restored = _build_file_restoration(to_summarise, file_cache or {})
-        if restored:
-            history.append({
-                "role": "user",
-                "content": f"[FILE CACHE RESTORED AFTER COMPACTION — these are the files you were working with]\n\n{restored}"
-            })
-            history.append({
-                "role": "assistant",
-                "content": "File contents restored. I have full working context of all the files I was editing."
-            })
-
-        console.print(
-            f"\n  [dim cyan]⚡ Auto-compacted {cutoff} messages → 1 summary"
-            f"{' + ' + str(len(_cache_paths(file_cache))) + ' files restored' if restored else ''}"
-            f" ({_estimate_tokens([compact_msg]):,} tokens)[/dim cyan]\n"
-        )
-        return True
     except Exception:
         return False
+
+    # ── Append file operation list to summary ────────────────────────────────
+    if read_files or modified_files:
+        summary += "\n\n## Files Accessed\n"
+        if modified_files:
+            summary += "**Modified:** " + ", ".join(sorted(modified_files)) + "\n"
+        if read_files:
+            summary += "**Read:** " + ", ".join(sorted(read_files)) + "\n"
+
+    compact_msg = {
+        "role":    "assistant",
+        "content": f"[AUTO-COMPACTED SESSION SUMMARY — {cutoff} messages → 1]\n{summary}",
+    }
+    prefix = []
+    if first_user:
+        prefix.append({
+            "role":    "user",
+            "content": f"[ORIGINAL TASK — preserved through compaction]\n{first_user.get('content', '')}",
+        })
+    history[:] = prefix + [compact_msg] + keep
+
+    # Re-inject actively-used files so the model keeps full working context
+    restored = _build_file_restoration(to_summarise, file_cache or {})
+    if restored:
+        history.append({
+            "role":    "user",
+            "content": f"[FILE CACHE RESTORED AFTER COMPACTION — files you were working with]\n\n{restored}",
+        })
+        history.append({
+            "role":    "assistant",
+            "content": "File contents restored. I have full working context of all files I was editing.",
+        })
+
+    action = "incremental update" if previous_summary else "full summary"
+    console.print(
+        f"\n  [dim cyan]⚡ Auto-compacted {cutoff} messages → 1 ({action})"
+        f"{' + ' + str(len(_cache_paths(file_cache))) + ' files restored' if restored else ''}"
+        f"  ({context_tokens:,} → ~{_COMPACT_KEEP_RECENT:,} tokens)[/dim cyan]\n"
+    )
+    return True
 
 def run_agent(
     task: str,
@@ -1182,14 +1374,15 @@ def run_agent(
         configured_model = cfg.get("model", "deepseek-v4-flash")
 
     if not silent:
+        from .config import model_label
         if active_model != configured_model:
             icon = "🧠" if active_model == "deepseek-v4-pro" else "⚡"
             console.print(
-                f"  {icon} [dim]Auto-selected [cyan]{active_model}[/cyan] ({model_reason})[/dim]"
+                f"  {icon} [dim]Auto-selected [cyan]{model_label(active_model)}[/cyan] ({model_reason})[/dim]"
             )
         else:
             icon = "🧠" if active_model == "deepseek-v4-pro" else "⚡"
-            console.print(f"  {icon} [dim]{active_model}[/dim]")
+            console.print(f"  {icon} [dim]{model_label(active_model)}[/dim]")
 
     # Build tool list for this agent:
     # - Coordinator mode gets coordinator tools (spawn_worker/send_message/task_stop + reads)
@@ -1207,6 +1400,9 @@ def run_agent(
     else:
         # Main agent: all tools including spawn_agent
         active_tools = TOOLS
+
+    _last_prompt_tokens = 0          # actual API prompt-token count from the previous turn
+    _overflow_recovery_attempted = False  # prevent infinite compact → overflow → compact loops
 
     for iteration in range(max_iter):
         # Warn once at 80% of limit so user can /compact before hitting the wall
@@ -1230,7 +1426,8 @@ def run_agent(
                 )
 
         # Auto-compact if history is getting large (mutates history in-place)
-        _auto_compact(history, client, active_model, file_cache=file_cache)
+        _auto_compact(history, client, active_model, file_cache=file_cache,
+                      last_context_tokens=_last_prompt_tokens)
 
         # Rebuild messages — recent full, older compressed
         messages = _build_api_messages(system_content, history)
@@ -1288,7 +1485,8 @@ def run_agent(
             _tc_snapshot = {k: dict(v) for k, v in tool_calls_raw.items()}
 
             _stream_err = None
-            for _attempt in range(3):
+            _err_class  = None
+            for _attempt in range(5):  # up to 5 for transient; billing/overflow break early
                 try:
                     stream = client.chat.completions.create(
                         model=active_model,
@@ -1320,6 +1518,7 @@ def run_agent(
                     _stream_err = None
                     break
                 except Exception as _api_exc:
+                    _err_class  = _classify_api_error(_api_exc)
                     _stream_err = _api_exc
                     # Roll back partial state from the failed stream before retrying
                     del content_parts[_cp_len:]
@@ -1327,24 +1526,43 @@ def run_agent(
                     tool_calls_raw.update(_tc_snapshot)
                     finish_reason = None
                     _round_in = _round_out = 0
-                    if _attempt < 2:
-                        _wait = 2 ** _attempt
+
+                    if _err_class == "billing":
                         if not silent:
                             console.print(
-                                f"  [yellow]⚠ API error: {str(_api_exc)[:120]} — "
-                                f"retrying in {_wait}s ({_attempt + 2}/3)[/yellow]"
+                                f"\n  [bold red]✗ Billing/quota error — stopping: "
+                                f"{str(_api_exc)[:200]}[/bold red]\n"
+                            )
+                        break  # retrying hits the same wall
+
+                    if _err_class == "overflow":
+                        break  # handled by overflow recovery block below
+
+                    # transient or unknown — exponential backoff, capped at 30s
+                    if _attempt < 4:
+                        _wait = min(2 ** _attempt, 30)
+                        if not silent:
+                            console.print(
+                                f"  [yellow]⚠ API error ({_err_class}): "
+                                f"{str(_api_exc)[:120]} — "
+                                f"retrying in {_wait}s ({_attempt + 2}/5)[/yellow]"
                             )
                         time.sleep(_wait)
 
-            if _stream_err is not None:
-                err_text = f"API request failed after 3 attempts: {_stream_err}"
+            if _stream_err is not None and _err_class != "overflow":
+                err_text = f"API request failed: {_stream_err}"
                 if not silent:
                     console.print(f"\n  [bold red]✗ {err_text}[/bold red]\n")
                 history.append({"role": "assistant", "content": f"[{err_text}]"})
                 return err_text
 
+            if _stream_err is not None and _err_class == "overflow":
+                break  # exit continuation loop — overflow handler below
+
             usage_in  += _round_in
             usage_out += _round_out
+            if _round_in > 0:
+                _last_prompt_tokens = _round_in
             _was_truncated = (finish_reason == "length")
 
             if _was_truncated and not tool_calls_raw and _continues < 3:
@@ -1365,6 +1583,32 @@ def run_agent(
                 ]
                 continue
             break
+
+        # ── Context overflow recovery ─────────────────────────────────────────
+        # The model returned a context-length error. Compact history and retry
+        # this iteration rather than giving up. The _overflow_recovery_attempted
+        # flag prevents infinite compact → overflow → compact loops.
+        if _stream_err is not None and _err_class == "overflow":
+            if not _overflow_recovery_attempted:
+                _overflow_recovery_attempted = True
+                if not silent:
+                    console.print(
+                        "\n  [bold yellow]⚠ Context overflow — compacting history "
+                        "and retrying...[/bold yellow]\n"
+                    )
+                _auto_compact(history, client, active_model,
+                              file_cache=file_cache,
+                              last_context_tokens=_last_prompt_tokens,
+                              force=True)
+                continue  # restart the for-loop iteration with compacted history
+            else:
+                err_text = (
+                    "Context overflow: even after compaction the context is too large. "
+                    "Try /compact then re-send your task."
+                )
+                if not silent:
+                    console.print(f"\n  [bold red]✗ {err_text}[/bold red]\n")
+                return err_text
 
         total_in  += usage_in
         total_out += usage_out
@@ -1389,7 +1633,7 @@ def run_agent(
             console.print(Panel(
                 Markdown(full_content),
                 border_style="green",
-                title="[bold green]BharatCode[/bold green]",
+                title="[bold green]Sylithe Code[/bold green]",
                 padding=(0, 1),
             ))
 
@@ -1442,74 +1686,104 @@ def run_agent(
         if not silent:
             console.print()
 
-        # Parallel spawn: when the model calls spawn_agent multiple times in one
-        # response, fire all of them in threads simultaneously instead of sequentially.
+        # Parallel pre-pass: when the model calls multiple parallel-safe tools in
+        # one response, fire them all in threads simultaneously. Tools in
+        # _PARALLEL_TOOLS have no shared mutable session state so this is safe.
+        # spawn_agent gets its own rich display; other tools share a generic one.
         _par_results: dict[str, str] = {}
-        _spawn_list = [(tc["id"], tc) for tc in tool_calls_raw.values()
-                       if tc["name"] == "spawn_agent"]
-        if len(_spawn_list) > 1:
+        _par_list = [(tc["id"], tc) for tc in tool_calls_raw.values()
+                     if tc["name"] in _PARALLEL_TOOLS]
+        if len(_par_list) > 1:
             import threading as _th
             from .subagent import AGENT_TYPES as _AT
 
+            _spawn_calls = [(cid, tc) for cid, tc in _par_list if tc["name"] == "spawn_agent"]
+            _other_calls = [(cid, tc) for cid, tc in _par_list if tc["name"] != "spawn_agent"]
+
             if not silent:
-                _labels = "  ".join(
-                    f"[cyan]{_AT.get(json.loads(tc.get('arguments') or '{}').get('agent_type','general'), _AT['general'])['icon']} "
-                    f"{_AT.get(json.loads(tc.get('arguments') or '{}').get('agent_type','general'), _AT['general'])['label']}[/cyan]"
-                    for _, tc in _spawn_list
-                )
-                console.print(
-                    f"\n  [bold cyan]⚡ {len(_spawn_list)} agents launching in parallel[/bold cyan]  "
-                    f"{_labels}\n"
-                )
+                if _spawn_calls:
+                    _labels = "  ".join(
+                        f"[cyan]{_AT.get(json.loads(tc.get('arguments') or '{}').get('agent_type','general'), _AT['general'])['icon']} "
+                        f"{_AT.get(json.loads(tc.get('arguments') or '{}').get('agent_type','general'), _AT['general'])['label']}[/cyan]"
+                        for _, tc in _spawn_calls
+                    )
+                    console.print(
+                        f"\n  [bold cyan]⚡ {len(_spawn_calls)} agents launching in parallel[/bold cyan]  "
+                        f"{_labels}\n"
+                    )
+                if _other_calls:
+                    _names = "  ".join(f"[cyan]{tc['name']}[/cyan]" for _, tc in _other_calls)
+                    console.print(
+                        f"\n  [bold cyan]⚡ {len(_other_calls)} tools running in parallel[/bold cyan]  "
+                        f"{_names}\n"
+                    )
 
             _par_lock = _th.Lock()
 
             def _run_par(cid: str, tc_item: dict):
+                _name = tc_item["name"]
                 _args = {}
                 try:
-                    _args = json.loads(tc_item["arguments"])
+                    _args = json.loads(tc_item.get("arguments") or "{}")
                 except Exception:
                     pass
-                _sub_type = _args.get("agent_type", "general")
-                _sub_task = _args.get("task", "")
-                _info     = _AT.get(_sub_type, _AT["general"])
-                if not _sub_task:
+
+                if _name == "spawn_agent":
+                    _sub_type = _args.get("agent_type", "general")
+                    _sub_task = _args.get("task", "")
+                    _info     = _AT.get(_sub_type, _AT["general"])
+                    if not _sub_task:
+                        with _par_lock:
+                            _par_results[cid] = "Error: spawn_agent requires a 'task' argument."
+                        return
+                    _sys = system_content + _info["system_suffix"]
+                    _t0  = time.time()
+                    try:
+                        _out = run_agent(
+                            task=_sub_task,
+                            project_path=project_path,
+                            auto_approve=True,
+                            history=[],
+                            system_content=_sys,
+                            file_cache=_cache_copy(file_cache),
+                            allowed_tools=_info["allowed_tools"],
+                            silent=True,
+                        ) or ""
+                        _dur = time.time() - _t0
+                        _r = (
+                            f"[{_info['label']} Agent — {_dur:.1f}s]\n\n{_out}"
+                            if _out else
+                            f"[{_info['label']} Agent completed in {_dur:.1f}s — no output]"
+                        )
+                    except Exception as _exc:
+                        _r = f"[{_info['label']} Agent failed: {_exc}]"
                     with _par_lock:
-                        _par_results[cid] = "Error: spawn_agent requires a 'task' argument."
-                    return
-                _sys = system_content + _info["system_suffix"]
-                _t0  = time.time()
-                try:
-                    _out = run_agent(
-                        task=_sub_task,
-                        project_path=project_path,
-                        auto_approve=True,
-                        history=[],
-                        system_content=_sys,
-                        file_cache=_cache_copy(file_cache),
-                        allowed_tools=_info["allowed_tools"],
-                        silent=True,
-                    ) or ""
-                    _dur = time.time() - _t0
-                    _r = (
-                        f"[{_info['label']} Agent — {_dur:.1f}s]\n\n{_out}"
-                        if _out else
-                        f"[{_info['label']} Agent completed in {_dur:.1f}s — no output]"
-                    )
-                except Exception as _exc:
-                    _r = f"[{_info['label']} Agent failed: {_exc}]"
-                with _par_lock:
-                    _par_results[cid] = _r
-                if not silent:
-                    _dur = time.time() - _t0
-                    console.print(
-                        f"  [dim green]✓[/dim green] {_info['icon']} "
-                        f"[bold]{_info['label']}[/bold]  [dim]{_dur:.1f}s[/dim]"
-                    )
+                        _par_results[cid] = _r
+                    if not silent:
+                        _dur = time.time() - _t0
+                        console.print(
+                            f"  [dim green]✓[/dim green] {_info['icon']} "
+                            f"[bold]{_info['label']}[/bold]  [dim]{_dur:.1f}s[/dim]"
+                        )
+                else:
+                    # General parallel tool — no session-state side effects
+                    _t0 = time.time()
+                    try:
+                        _r = execute_tool(_name, _args)
+                    except Exception as _exc:
+                        _r = f"Error: {_exc}"
+                    with _par_lock:
+                        _par_results[cid] = _r
+                    if not silent:
+                        _dur = time.time() - _t0
+                        console.print(
+                            f"  [dim green]✓[/dim green] [cyan]{_name}[/cyan]  "
+                            f"[dim]{_dur:.1f}s[/dim]"
+                        )
 
             _par_threads = [
                 _th.Thread(target=_run_par, args=(cid, tc_), daemon=True)
-                for cid, tc_ in _spawn_list
+                for cid, tc_ in _par_list
             ]
             for _t in _par_threads:
                 _t.start()
@@ -1517,9 +1791,10 @@ def run_agent(
                 _t.join()
 
             if not silent:
-                console.print(
-                    f"\n  [dim]All {len(_spawn_list)} parallel agents done.[/dim]\n"
-                )
+                console.print(f"\n  [dim]All {len(_par_list)} parallel tools done.[/dim]\n")
+
+        _batch_exec_count = 0   # tools that actually ran this batch
+        _batch_term_count = 0   # of those, how many returned _TERMINATE_SENTINEL
 
         for tc in tool_calls_raw.values():
             name = tc["name"]
@@ -1569,8 +1844,12 @@ def run_agent(
 
             _spinner = console.status("", spinner="dots") if not silent else nullcontext()
             with _spinner:
-                # ── Coordinator tools ────────────────────────────────────────
-                if name == "spawn_worker" and worker_pool is not None:
+                # ── Parallel pre-results: serve any tool that ran in the pre-pass ──
+                if tc["id"] in _par_results:
+                    result = _par_results[tc["id"]]
+
+                # ── Coordinator tools ─────────────────────────────────────────
+                elif name == "spawn_worker" and worker_pool is not None:
                     wid = worker_pool.spawn(
                         task=args.get("task", ""),
                         agent_type=args.get("agent_type", "general"),
@@ -1736,33 +2015,30 @@ def run_agent(
                     if not silent and not result.startswith("Error"):
                         _render_todos(todo_state)
                 elif name == "spawn_agent":
-                    if tc["id"] in _par_results:
-                        # Already ran in parallel above — just retrieve the result
-                        result = _par_results[tc["id"]]
+                    # Sequential single-call path (parallel calls are handled above)
+                    from .subagent import run_subagent, AGENT_TYPES
+                    sub_type  = args.get("agent_type", "general")
+                    sub_task  = args.get("task", "")
+                    if not sub_task:
+                        result = "Error: spawn_agent requires a 'task' argument."
                     else:
-                        from .subagent import run_subagent, AGENT_TYPES
-                        sub_type  = args.get("agent_type", "general")
-                        sub_task  = args.get("task", "")
-                        if not sub_task:
-                            result = "Error: spawn_agent requires a 'task' argument."
-                        else:
-                            info       = AGENT_TYPES.get(sub_type, AGENT_TYPES["general"])
-                            sub_result = run_subagent(
-                                task=sub_task,
-                                agent_type=sub_type,
-                                project_path=project_path,
-                                parent_system=system_content,
-                                parent_file_cache=file_cache,
+                        info       = AGENT_TYPES.get(sub_type, AGENT_TYPES["general"])
+                        sub_result = run_subagent(
+                            task=sub_task,
+                            agent_type=sub_type,
+                            project_path=project_path,
+                            parent_system=system_content,
+                            parent_file_cache=file_cache,
+                        )
+                        if sub_result.success and sub_result.output:
+                            result = (
+                                f"[{info['label']} Agent — {sub_result.duration:.1f}s]\n\n"
+                                f"{sub_result.output}"
                             )
-                            if sub_result.success and sub_result.output:
-                                result = (
-                                    f"[{info['label']} Agent — {sub_result.duration:.1f}s]\n\n"
-                                    f"{sub_result.output}"
-                                )
-                            elif sub_result.error:
-                                result = f"[{info['label']} Agent failed: {sub_result.error}]"
-                            else:
-                                result = f"[{info['label']} Agent completed in {sub_result.duration:.1f}s — no output]"
+                        elif sub_result.error:
+                            result = f"[{info['label']} Agent failed: {sub_result.error}]"
+                        else:
+                            result = f"[{info['label']} Agent completed in {sub_result.duration:.1f}s — no output]"
                 else:
                     result = execute_tool(name, args)
 
@@ -1772,12 +2048,26 @@ def run_agent(
             if not silent:
                 _show_tool_done(name, result, elapsed)
 
+            # Terminate signal: count tools that want to stop the loop
+            if result == _TERMINATE_SENTINEL:
+                _batch_term_count += 1
+                result = "Agent signaled task completion."
+            _batch_exec_count += 1
+
             # Store full result in history — _build_api_messages compresses old ones
             history.append({
                 "role":         "tool",
                 "tool_call_id": tc["id"],
                 "content":      _truncate_result(result),
             })
+
+        # If every executed tool in this batch signaled termination, exit the loop
+        if _batch_exec_count > 0 and _batch_term_count == _batch_exec_count:
+            if not silent:
+                console.print(
+                    "\n  [bold yellow]🛑 All tools signaled termination — stopping.[/bold yellow]\n"
+                )
+            break
 
         if not silent:
             console.print()

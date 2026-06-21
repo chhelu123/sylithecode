@@ -68,7 +68,7 @@ def ask_permission(tool_name: str, args: dict) -> bool:
     console.print()
     console.print(Panel(
         f"[bold yellow]{cmd}[/bold yellow]",
-        title="[bold red] BharatCode wants to run a command [/bold red]",
+        title="[bold red] Sylithe Code wants to run a command [/bold red]",
         border_style="yellow",
         padding=(0, 1),
     ))

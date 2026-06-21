@@ -1,5 +1,5 @@
 """
-BharatCode CLI — main entry point.
+Sylithe Code CLI — main entry point.
 Inspired by Claude Code's CLI architecture.
 """
 import os
@@ -37,20 +37,38 @@ from .commands import handle_slash_command
 
 @click.group(invoke_without_command=True)
 @click.pass_context
+@click.argument("task", required=False, default=None)
 @click.option("--auto-approve", "-y", is_flag=True, help="Auto-approve all bash commands (yolo mode)")
 @click.option("--model", "-m", default=None, help="Override model for this run")
-def cli(ctx, auto_approve, model):
-    """BharatCode — AI Coding Agent for Indian Developers
+@click.option("--print", "-p", "print_mode", is_flag=True,
+              help="Non-interactive: run task once and print output, then exit. "
+                   "Reads from stdin if piped: cat file.py | bharatcode -p 'explain this'")
+def cli(ctx, task, auto_approve, model, print_mode):
+    """Sylithe Code — AI Coding Agent for Indian Developers
 
     \b
     Run without arguments to enter interactive mode.
+    Pass a TASK with --print for non-interactive / piped use:
+      bharatcode --print "explain this file" < src/app.py
+      cat error.log | bharatcode -p "fix this"
     Or use a subcommand: fix, build, review, audit, test, explain...
     """
     ctx.ensure_object(dict)
     ctx.obj["auto_approve"] = auto_approve
     ctx.obj["model"]        = model
-    if ctx.invoked_subcommand is None:
-        interactive_mode(auto_approve=auto_approve)
+
+    if ctx.invoked_subcommand is not None:
+        return
+
+    # ── Non-interactive / pipe mode ───────────────────────────────────────────
+    # Triggered by --print flag OR when stdin is a pipe/file (not a terminal).
+    stdin_is_pipe = not sys.stdin.isatty()
+    if print_mode or stdin_is_pipe:
+        _print_mode(task=task, auto_approve=auto_approve, model=model)
+        return
+
+    # ── Interactive REPL ──────────────────────────────────────────────────────
+    interactive_mode(auto_approve=auto_approve)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -60,7 +78,7 @@ def cli(ctx, auto_approve, model):
 @click.option("--model", help="Set model (deepseek-v4-flash or deepseek-v4-pro)")
 @click.option("--auto-approve", is_flag=True, default=None, help="Enable auto-approve by default")
 def config(key, show, model, auto_approve):
-    """Configure BharatCode settings."""
+    """Configure Sylithe Code settings."""
     cfg = load_config()
     changed = False
 
@@ -441,7 +459,7 @@ Start by analyzing what the app does, design the data models and architecture, t
 
 @cli.command()
 def init():
-    """Initialize BharatCode in your project (creates BHARATCODE.md)."""
+    """Initialize Sylithe Code in your project (creates BHARATCODE.md)."""
     p = Path("BHARATCODE.md")
     if p.exists():
         show_warning("BHARATCODE.md already exists.")
@@ -450,7 +468,7 @@ def init():
     name  = Prompt.ask("[bold]Project name[/bold]")
     stack = Prompt.ask("[bold]Tech stack[/bold]", default="Python/Flask")
 
-    p.write_text(f"""# {name} — BharatCode Config
+    p.write_text(f"""# {name} — Sylithe Code Config
 
 ## Tech Stack
 {stack}
@@ -471,7 +489,7 @@ def init():
 - Start: `python app.py` (or `npm start`)
 - Lint: `flake8` (or `eslint .`)
 
-## Notes for BharatCode
+## Notes for Sylithe Code
 <!-- Special instructions for the AI agent -->
 - Never commit .env files
 - Always run tests after fixes
@@ -481,6 +499,60 @@ def init():
     show_info("Edit BHARATCODE.md to add project-specific instructions.")
 
 # ── Paste-aware input ─────────────────────────────────────────────────────────
+
+def _print_mode(task: str | None, auto_approve: bool, model: str | None):
+    """Non-interactive mode: run once and print the final answer, then exit.
+
+    Usage:
+      bharatcode --print "explain this"
+      bharatcode -p "fix this bug" < src/app.py
+      cat error.log | bharatcode -p "what is wrong here"
+    """
+    from .config import save_config, load_config, MODEL_API_MAP, MODEL_ALIASES
+
+    # ── Override model for this run if -m was passed ──────────────────────────
+    if model:
+        cfg = load_config()
+        api_model = MODEL_API_MAP.get(model) or MODEL_ALIASES.get(model) or model
+        cfg["model"] = api_model
+        save_config(cfg)
+
+    # ── Build the task string ─────────────────────────────────────────────────
+    stdin_content = ""
+    if not sys.stdin.isatty():
+        stdin_content = sys.stdin.read()
+
+    if not task and not stdin_content:
+        click.echo(
+            "Usage: bharatcode --print \"your task\"\n"
+            "       cat file.py | bharatcode -p \"explain this\"\n"
+            "       bharatcode -p \"fix the bug\" < src/app.py",
+            err=True,
+        )
+        sys.exit(1)
+
+    if stdin_content and task:
+        full_task = f"{task}\n\n--- stdin ---\n{stdin_content}"
+    elif stdin_content:
+        full_task = stdin_content
+    else:
+        full_task = task
+
+    # ── Run agent once, capture output ────────────────────────────────────────
+    cwd = os.getcwd()
+    system_content = _build_system(cwd)
+
+    output = run_agent(
+        full_task,
+        project_path=cwd,
+        auto_approve=auto_approve,
+        system_content=system_content,
+        silent=True,
+    )
+
+    if output:
+        print(output)
+
 
 def _read_input() -> str:
     """

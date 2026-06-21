@@ -13,7 +13,13 @@ CONFIG_DIR  = Path.home() / ".bharatcode"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 LOG_FILE    = CONFIG_DIR / "tool_log.txt"
 
-# Model aliases — old names redirect to new ones transparently
+# Maps user-facing Sylithe names → real DeepSeek API model IDs
+MODEL_API_MAP = {
+    "sylithe-flash": "deepseek-v4-flash",
+    "sylithe-pro":   "deepseek-v4-pro",
+}
+
+# Model aliases — old names redirect transparently (no-op if already API names)
 MODEL_ALIASES = {
     "deepseek-chat":     "deepseek-v4-flash",
     "deepseek-reasoner": "deepseek-v4-pro",
@@ -57,10 +63,31 @@ def get_api_key() -> str:
         )
     return key
 
+def model_label(model: str) -> str:
+    """User-facing display name for a model ID."""
+    return {"deepseek-v4-flash": "Sylithe Code Flash", "deepseek-v4-pro": "Sylithe Code Pro"}.get(model, model)
+
 def load_project_instructions(cwd: str = ".") -> str:
-    """Read BHARATCODE.md from project root — injected into every system prompt."""
-    for name in ["BHARATCODE.md", ".bharatcode.md"]:
-        p = Path(cwd) / name
-        if p.exists():
-            return f"\n\n--- Project Instructions (from {name}) ---\n{p.read_text()}"
-    return ""
+    """Walk up from cwd looking for BHARATCODE.md — like Claude Code's CLAUDE.md walk.
+    Parent-directory files are included first; child directory overrides take precedence."""
+    found: list[str] = []
+    current = Path(cwd).resolve()
+    visited: set[Path] = set()
+    while current not in visited:
+        visited.add(current)
+        for name in ("BHARATCODE.md", ".bharatcode.md"):
+            p = current / name
+            if p.exists():
+                try:
+                    found.append(
+                        f"\n\n--- Project Instructions ({p}) ---\n"
+                        + p.read_text(encoding="utf-8")
+                    )
+                except Exception:
+                    pass
+        parent = current.parent
+        if parent == current:   # filesystem root
+            break
+        current = parent
+    # Reverse so parent-dir instructions appear first, child dir last (highest priority)
+    return "".join(reversed(found))
